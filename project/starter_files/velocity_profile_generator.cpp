@@ -4,397 +4,247 @@
  *      Author: Munir Jojo-Verge
  **********************************************/
 
-/**
- * @file velocity_trajectory_generator.cpp
- **/
+#include "motion_planner.h"
 
-#include "velocity_profile_generator.h"
+MotionPlanner::~MotionPlanner() {}
 
-#include <cfloat>
-#include <cmath>
-#include <cstdlib>
-#include <thread>
+State MotionPlanner::get_goal_state_in_ego_frame(const State& ego_state,
+                                                 const State& goal_state) {
+  // Let's start by making a copy of the goal state (global reference frame)
+  auto goal_state_ego_frame = goal_state;
 
-VelocityProfileGenerator::VelocityProfileGenerator() {}
-VelocityProfileGenerator::~VelocityProfileGenerator() {}
+  // Translate so the ego state is at the origin in the new frame.
+  // This is done by subtracting the ego_state from the goal_ego_.
+  goal_state_ego_frame.location.x -= ego_state.location.x;
+  goal_state_ego_frame.location.y -= ego_state.location.y;
+  goal_state_ego_frame.location.z -= ego_state.location.z;
 
-void VelocityProfileGenerator::setup(const double& time_gap,
-                                     const double& a_max,
-                                     const double& slow_speed) {
-  _time_gap = time_gap;
-  _a_max = a_max;
-  _slow_speed = slow_speed;
-};
+  /* Rotate such that the ego state has zero heading/yaw in the new frame.
+     We are rotating by -ego_state "yaw" to ensure the ego vehicle's
+     current yaw corresponds to theta = 0 in the new local frame.
 
-/*
-This class computes a velocity trajectory from a starting speed to a desired
-speed. It works in unison with the Behavioral plannner  as it needs to build a
-velocity profile for each of the states that the vehicle can be in.
-In the "Follow_lane" state we need to either speed up or speed down to maintain
-a speed target. In the "decel_to_stop" state we need to create a profile that
-allows us to decelerate smoothly to a stop line.
-
-The order of precedence for handling these cases is stop sign handling and then
-nominal lane maintenance. In a real velocity planner you would need to handle
-the coupling between these states, but for simplicity this project can be
-implemented by isolating each case.
-
-For all trajectories, the required acceleration is given by _a_max (confortable
-accel).
-Look at the structs.h for details on the types of manuevers/states that the
-behavior planner can be in.
-*/
-
-std::vector<TrajectoryPoint> VelocityProfileGenerator::generate_trajectory(
-    const std::vector<PathPoint>& spiral, const double& desired_speed,
-    const State& ego_state, const State& lead_car_state,
-    const Maneuver& maneuver) const {
-  // LOG(INFO) << "Lead car x: " << lead_car_state.location.x;
-
-  std::vector<TrajectoryPoint> trajectory;
-  double start_speed = utils::magnitude(ego_state.velocity);
-
-  // LOG(INFO) << "Start Speed (m/s): " << start_speed;
-  // LOG(INFO) << "Desired Speed (m/s): " << desired_speed;
-
-  // Generate a trapezoidal trajectory to decelerate to stop.
-  if (maneuver == DECEL_TO_STOP) {
-    // LOG(INFO) << "Generating velocity trajectory for DECEL_TO_STOP";
-    trajectory = decelerate_trajectory(spiral, start_speed);
-  }
-  // If we need to follow the lead vehicle, make sure we decelerate to its speed
-  // by the time we reach the time gap point.
-  else if (maneuver == FOLLOW_VEHICLE) {
-    // LOG(INFO) << "Generating velocity trajectory for FOLLOW_VEHICLE";
-    trajectory =
-        follow_trajectory(spiral, start_speed, desired_speed, lead_car_state);
-  }
-
-  // Otherwise, compute the trajectory to reach our desired speed.
-  else {
-    // LOG(INFO) << "Generating velocity trajectory for NOMINAL TRAVEL";
-    trajectory = nominal_trajectory(spiral, start_speed, desired_speed);
-  }
-  // Interpolate between the zeroth state and the first state.
-  // This prevents the controller from getting stuck at the zeroth state.
-  if (trajectory.size() > 1) {
-    TrajectoryPoint interpolated_state;
-    interpolated_state.path_point.x =
-        (trajectory[1].path_point.x - trajectory[0].path_point.x) * 0.1 +
-        trajectory[0].path_point.x;
-    interpolated_state.path_point.y =
-        (trajectory[1].path_point.y - trajectory[0].path_point.y) * 0.1 +
-        trajectory[0].path_point.y;
-    interpolated_state.path_point.z =
-        (trajectory[1].path_point.z - trajectory[0].path_point.z) * 0.1 +
-        trajectory[0].path_point.z;
-    interpolated_state.v =
-        (trajectory[1].v - trajectory[0].v) * 0.1 + trajectory[0].v;
-    trajectory[0] = interpolated_state;
-  }
-
-  return trajectory;
-}
-
-// Computes a velocity trajectory for deceleration to a full stop.
-std::vector<TrajectoryPoint> VelocityProfileGenerator::decelerate_trajectory(
-    const std::vector<PathPoint>& spiral, const double& start_speed) const {
-  std::vector<TrajectoryPoint> trajectory;
-
-  // Using d = (v_f^2 - v_i^2) / (2 * a)
-  auto decel_distance = calc_distance(start_speed, _slow_speed, -_a_max);
-  auto brake_distance = calc_distance(_slow_speed, 0, -_a_max);
-
-  auto path_length{0.0};
-  auto stop_index{spiral.size() - 1};
-  for (size_t i = 0; i < stop_index; ++i) {
-    path_length += utils::distance(spiral[i + 1], spiral[i]);
-  }
-
-  /* If the brake distance exceeds the length of the path, then we cannot
-  perform a smooth deceleration and require a harder deceleration.  Build the path
-  up in reverse to ensure we reach zero speed at the required time.
+     Recall that the general rotation matrix around the Z axix is:
+     [cos(theta) -sin(theta)
+     sin(theta)  cos(theta)]
   */
-  if (brake_distance + decel_distance > path_length) {
-    std::vector<double> speeds;
-    auto vf{0.0};
-    // Let's add the last point, i.e at the stopping line we should have speed
-    // 0.0.
-    auto it = speeds.begin();
-    speeds.insert(it, 0.0);
+  auto theta_rad = -ego_state.rotation.yaw;
+  auto cos_theta = std::cos(theta_rad);
+  auto sin_theta = std::sin(theta_rad);
 
-    // Let's now go backwards until we get to the very beginning of the path
-    for (int i = stop_index - 1; i >= 0; --i) {
-      auto dist = utils::distance(spiral[i + 1], spiral[i]);
-      auto vi = calc_final_speed(vf, -_a_max, dist);
-      if (vi > start_speed) {
-        vi = start_speed;
-      }
-      // Let's add it
-      auto it = speeds.begin();
-      speeds.insert(it, vi);
-      vf = vi;
-    }
+  goal_state_ego_frame.location.x =
+      cos_theta * goal_state_ego_frame.location.x -
+      sin_theta * goal_state_ego_frame.location.y;
+  goal_state_ego_frame.location.y =
+      sin_theta * goal_state_ego_frame.location.x +
+      cos_theta * goal_state_ego_frame.location.y;
 
-    // At this point we have all the speeds. Now we need to create the
-    // trajectory
-    double time_step{0.0};
-    double time{0.0};
-    for (size_t i = 0; i < speeds.size() - 1; ++i) {
-      TrajectoryPoint traj_point;
-      traj_point.path_point = spiral[i];
-      traj_point.v = speeds[i];
-      traj_point.relative_time = time;
-      trajectory.push_back(traj_point);
-      time_step = std::fabs(speeds[i] - speeds[i + 1]) / _a_max;  // Doubt!
-      time += time_step;
-    }
-    // We still need to add the last one
-    auto i = spiral.size() - 1;
-    TrajectoryPoint traj_point;
-    traj_point.path_point = spiral[i];
-    traj_point.v = speeds[i];
-    traj_point.relative_time = time;
-    trajectory.push_back(traj_point);
+  // Compute the goal yaw in the local frame by subtracting off the
+  // current ego yaw from the goal waypoint heading/yaw.
+  goal_state_ego_frame.rotation.yaw += theta_rad;
 
-    // If the brake distance DOES NOT exceed the length of the path
-  } else {
-    auto brake_index{stop_index};
-    auto temp_dist{0.0};
-    // Compute the index at which to start braking down to zero.
-    while ((brake_index > 0) and (temp_dist < brake_distance)) {
-      temp_dist +=
-          utils::distance(spiral[brake_index], spiral[brake_index - 1]);
-      --brake_index;
-    }
-    // Compute the index to stop decelerating to the slow speed.
-    uint decel_index{0};
-    temp_dist = 0.0;
-    while ((decel_index < brake_index) and (temp_dist < decel_distance)) {
-      temp_dist +=
-          utils::distance(spiral[decel_index + 1], spiral[decel_index]);
-      ++decel_index;
-    }
-    // At this point we have all the speeds. Now we need to create the
-    // trajectory
-    double time_step{0.0};
-    double time{0.0};
-    auto vi{start_speed};
-    for (size_t i = 0; i < decel_index; ++i) {
-      auto dist = utils::distance(spiral[i + 1], spiral[i]);
-      auto vf = calc_final_speed(vi, -_a_max, dist);
-      if (vf < _slow_speed) {
-        vf = _slow_speed;
-      }
-      TrajectoryPoint traj_point;
-      traj_point.path_point = spiral[i];
-      traj_point.v = vi;
-      traj_point.relative_time = time;
-      trajectory.push_back(traj_point);
-      time_step = std::fabs(vf - vi) / _a_max;
-      time += time_step;
-      vi = vf;
-    }
-    for (size_t i = decel_index; i < brake_index; ++i) {
-      TrajectoryPoint traj_point;
-      traj_point.path_point = spiral[i];
-      traj_point.v = vi;
-      traj_point.relative_time = time;
-      trajectory.push_back(traj_point);
-      auto dist = utils::distance(spiral[i + 1], spiral[i]);  // ??
-      if (dist > DBL_EPSILON)
-        time_step = vi / dist;
-      else
-        time_step = 0.00;
+  // Ego speed is the same in both coordenates
+  // the Z coordinate does not get affected by the rotation.
 
-      time += time_step;
-    }
-    for (size_t i = brake_index; i < stop_index; ++i) {
-      auto dist = utils::distance(spiral[i + 1], spiral[i]);
-      auto vf = calc_final_speed(vi, -_a_max, dist);
-      TrajectoryPoint traj_point;
-      traj_point.path_point = spiral[i];
-      traj_point.v = vi;
-      traj_point.relative_time = time;
-      trajectory.push_back(traj_point);
-      time_step = std::fabs(vf - vi) / _a_max;
-      time += time_step;
-      vi = vf;
-    }
-    // Now we just need to add the last point.
-    auto i = stop_index;
-    TrajectoryPoint traj_point;
-    traj_point.path_point = spiral[i];
-    traj_point.v = 0.0;
-    traj_point.relative_time = time;
-    trajectory.push_back(traj_point);
-  }
-  return trajectory;
+  // Let's make sure the yaw is within [-180, 180] or [-pi, pi] so the optimizer
+  // works.
+  goal_state_ego_frame.rotation.yaw = utils::keep_angle_range_rad(
+      goal_state_ego_frame.rotation.yaw, -M_PI, M_PI);
+  // if (goal_state_ego_frame.rotation.yaw < -M_PI) {
+  //   goal_state_ego_frame.rotation.yaw += (2 * M_PI);
+  // } else if (goal_state_ego_frame.rotation.yaw > M_PI) {
+  //   goal_state_ego_frame.rotation.yaw -= (2 * M_PI);
+  // }
+
+  return goal_state_ego_frame;
 }
 
-// Computes a velocity trajectory for following a lead vehicle
-std::vector<TrajectoryPoint> VelocityProfileGenerator::follow_trajectory(
-    const std::vector<PathPoint>& spiral, const double& start_speed,
-    const double& desired_speed, const State& lead_car_state) const {
-  std::vector<TrajectoryPoint> trajectory;
-  return trajectory;
+std::vector<State> MotionPlanner::generate_offset_goals_ego_frame(
+    const State& ego_state, const State& goal_state) {
+  // Let's transform the "main" goal (goal state) into ego reference frame
+  auto goal_state_ego_frame =
+      get_goal_state_in_ego_frame(ego_state, goal_state);
+
+  return generate_offset_goals(goal_state_ego_frame);
 }
 
-// Computes a velocity trajectory for nominal speed tracking, a.k.a. Lane Follow
-// or Cruise Control
-std::vector<TrajectoryPoint> VelocityProfileGenerator::nominal_trajectory(
-    const std::vector<PathPoint>& spiral, const double& start_speed,
-    double const& desired_speed) const {
-  std::vector<TrajectoryPoint> trajectory;
-  double accel_distance;
+std::vector<State> MotionPlanner::generate_offset_goals_global_frame(
+    const State& goal_state) {
+  return generate_offset_goals(goal_state);
+}
 
-  // LOG(INFO) << "MAX_ACCEL: " << _a_max;
-  if (desired_speed < start_speed) {
-    // LOG(INFO) << "decelerate";
-    accel_distance = calc_distance(start_speed, desired_speed, -_a_max);
-  } else {
-    // LOG(INFO) << "accelerate";
-    accel_distance = calc_distance(start_speed, desired_speed, _a_max);
+std::vector<State> MotionPlanner::generate_offset_goals(
+    const State& goal_state) {
+  // Now we need to gernerate "_num_paths" goals offset from the center goal at
+  // a distance "_goal_offset".
+  std::vector<State> goals_offset;
+
+  // the goals will be aligned on a perpendiclular line to the heading of the
+  // main goal. To get a perpendicular angle, just add 90 (or PI/2) to the main
+  // goal heading.
+
+  // TODO-Perpendicular direction: ADD pi/2 to the goal yaw
+  // (goal_state.rotation.yaw)
+  auto yaw_plus_90 = M_PI_2 + goal_state.rotation.yaw;
+
+  // LOG(INFO) << "MAIN GOAL";
+  // LOG(INFO) << "x: " << goal_state.location.x << " y: " <<
+  // goal_state.location.y
+  //          << " z: " << goal_state.location.z
+  //          << " yaw (rad): " << goal_state.rotation.yaw;
+  // LOG(INFO) << "OFFSET GOALS";
+  // LOG(INFO) << "ALL offset yaw (rad): " << yaw;
+
+  for (int i = 0; i < _num_paths; ++i) {
+    auto goal_offset = goal_state;
+    float offset = (i - (int)(_num_paths / 2)) * _goal_offset;
+    // LOG(INFO) << "Goal: " << i + 1;
+    // LOG(INFO) << "(int)(_num_paths / 2): " << (int)(_num_paths / 2);
+    // LOG(INFO) << "(i - (int)(_num_paths / 2)): " << (i - (int)(_num_paths /
+    // 2)); LOG(INFO) << "_goal_offset: " << _goal_offset;
+
+    // LOG(INFO) << "offset: " << offset;
+
+    // TODO-offset goal location: calculate the x and y position of the offset
+    // goals using "offset" (calculated above) and knowing that the goals should
+    // lie on a perpendicular line to the direction (yaw) of the main goal. You
+    // calculated this direction above (yaw_plus_90). HINT: use
+    // std::cos(yaw_plus_90) and std::sin(yaw_plus_90)
+    goal_offset.location.x += offset * cos(yaw_plus_90);  // <- Fix This
+    goal_offset.location.y += offset * sin(yaw_plus_90;  // <- Fix This
+    // LOG(INFO) << "x: " << goal_offset.location.x
+    //          << " y: " << goal_offset.location.y
+    //          << " z: " << goal_offset.location.z
+    //          << " yaw (rad): " << goal_offset.rotation.yaw;
+
+    if (valid_goal(goal_state, goal_offset)) {
+      goals_offset.push_back(goal_offset);
+    }
   }
+  return goals_offset;
+}
 
-  size_t ramp_end_index{0};
-  double distance{0.0};
-  while (ramp_end_index < (spiral.size() - 1) && (distance < accel_distance)) {
-    distance +=
-        utils::distance(spiral[ramp_end_index], spiral[ramp_end_index + 1]);
-    ramp_end_index += 1;
+bool MotionPlanner::valid_goal(const State& main_goal,
+                               const State& offset_goal) {
+  auto max_offset = ((int)(_num_paths / 2) + 1) * _goal_offset;
+  // LOG(INFO) << "max offset: " << max_offset;
+  auto dist = utils::magnitude(main_goal.location - offset_goal.location);
+  // LOG(INFO) << "distance from main goal to offset goal: " << dist;
+  return dist < max_offset;
+}
+
+std::vector<int> MotionPlanner::get_best_spiral_idx(
+    const std::vector<std::vector<PathPoint>>& spirals,
+    const std::vector<State>& obstacles, const State& goal_state) {
+  // LOG(INFO) << "Num Spirals: " << spirals.size();
+  double best_cost = DBL_MAX;
+  std::vector<int> collisions;
+  int best_spiral_idx = -1;
+  for (size_t i = 0; i < spirals.size(); ++i) {
+    double cost = calculate_cost(spirals[i], obstacles, goal_state);
+
+    if (cost < best_cost) {
+      best_cost = cost;
+      best_spiral_idx = i;
+    }
+    if (cost > DBL_MAX) {
+      collisions.push_back(i);
+    }
   }
-  // LOG(INFO) << "ramp_end_index:" << ramp_end_index;
+  if (best_spiral_idx != -1) {
+    collisions.push_back(best_spiral_idx);
+    return collisions;
+  }
+  std::vector<int> noResults;
+  return noResults;
+}
 
-  double time_step{0.0};
-  double time{0.0};
-  double vi{start_speed};
+std::vector<std::vector<PathPoint>>
+MotionPlanner::transform_spirals_to_global_frame(
+    const std::vector<std::vector<PathPoint>>& spirals,
+    const State& ego_state) {
+  std::vector<std::vector<PathPoint>> transformed_spirals;
+  for (auto spiral : spirals) {
+    std::vector<PathPoint> transformed_single_spiral;
+    for (auto path_point : spiral) {
+      PathPoint new_path_point;
+      new_path_point.x = ego_state.location.x +
+                         path_point.x * std::cos(ego_state.rotation.yaw) -
+                         path_point.y * std::sin(ego_state.rotation.yaw);
+      new_path_point.y = ego_state.location.y +
+                         path_point.x * std::sin(ego_state.rotation.yaw) +
+                         path_point.y * std::cos(ego_state.rotation.yaw);
+      new_path_point.theta = path_point.theta + ego_state.rotation.yaw;
 
-  for (size_t i = 0; i < ramp_end_index; ++i) {
-    auto dist = utils::distance(spiral[i], spiral[i + 1]);
-    double vf;
-    if (desired_speed < start_speed) {
-      vf = calc_final_speed(vi, -_a_max, dist);
+      transformed_single_spiral.emplace_back(new_path_point);
+    }
+    transformed_spirals.emplace_back(transformed_single_spiral);
+  }
+  return transformed_spirals;
+}
 
-      if (vf < desired_speed) {
-        vf = desired_speed;
+std::vector<std::vector<PathPoint>> MotionPlanner::generate_spirals(
+    const State& ego_state, const std::vector<State>& goals) {
+  // Since we are on Ego Frame, the start point is always at 0, 0, 0,
+  PathPoint start;
+  start.x = ego_state.location.x;
+  start.y = ego_state.location.y;
+  start.z = ego_state.location.z;
+  start.theta = ego_state.rotation.yaw;
+  start.kappa = 0.0;
+  start.s = 0.0;
+  start.dkappa = 0.0;
+  start.ddkappa = 0.0;
+
+  std::vector<std::vector<PathPoint>> spirals;
+  for (auto goal : goals) {
+    PathPoint end;
+    end.x = goal.location.x;
+    end.y = goal.location.y;
+    end.z = goal.location.z;
+    end.theta = goal.rotation.yaw;
+    end.kappa = 0.0;
+    end.s = std::sqrt((end.x * end.x) + (end.y * end.y));
+    end.dkappa = 0.0;
+    end.ddkappa = 0.0;
+
+    if (_cubic_spiral.GenerateSpiral(start, end)) {
+      std::vector<PathPoint>* spiral = new std::vector<PathPoint>;
+      auto ok = _cubic_spiral.GetSampledSpiral(P_NUM_POINTS_IN_SPIRAL, spiral);
+      if (ok && valid_spiral(*spiral, goal)) {
+        // LOG(INFO) << "Spiral Valid ";
+        spirals.push_back(*spiral);
+      } else {
+        // LOG(INFO) << "Spiral Invalid ";
       }
     } else {
-      vf = calc_final_speed(vi, _a_max, dist);
-
-      if (vf > desired_speed) {
-        vf = desired_speed;
-      }
+      // LOG(INFO) << "Spiral Generation FAILED! ";
     }
-    TrajectoryPoint traj_point;
-    traj_point.path_point = spiral[i];
-    traj_point.v = vi;
-    traj_point.relative_time = time;
-    trajectory.push_back(traj_point);
-
-    // LOG(INFO) << i << "- x: " << traj_point.path_point.x
-    //          << ", y: " << traj_point.path_point.y
-    //          << ", th: " << traj_point.path_point.theta
-    //          << ", v: " << traj_point.v << ", t: " <<
-    //          traj_point.relative_time;
-    time_step = std::fabs(vf - vi) / _a_max;
-    time += time_step;
-    vi = vf;
   }
-
-  for (size_t i = ramp_end_index; i < spiral.size() - 1; ++i) {
-    TrajectoryPoint traj_point;
-    traj_point.path_point = spiral[i];
-    traj_point.v = desired_speed;
-    traj_point.relative_time = time;
-    trajectory.push_back(traj_point);
-
-    auto dist = utils::distance(spiral[i], spiral[i + 1]);
-    // This should never happen in a "nominal_trajectory", but it's a sanity
-    // check
-    if (std::abs(desired_speed) < DBL_EPSILON) {
-      time_step = 0.0;
-    } else {
-      time_step = dist / desired_speed;
-    }
-    time += time_step;
-
-    // LOG(INFO) << i << "- x: " << traj_point.path_point.x
-    //          << ", y: " << traj_point.path_point.y
-    //          << ", th: " << traj_point.path_point.theta
-    //          << ", v: " << traj_point.v << ", t: " <<
-    //          traj_point.relative_time;
-  }
-  // Add last point
-  auto i = spiral.size() - 1;
-  TrajectoryPoint traj_point;
-  traj_point.path_point = spiral[i];
-  traj_point.v = desired_speed;
-  traj_point.relative_time = time;
-  trajectory.push_back(traj_point);
-  // LOG(INFO) << i << "- x: " << traj_point.path_point.x
-  //          << ", y: " << traj_point.path_point.y
-  //          << ", th: " << traj_point.path_point.theta
-  //          << ", v: " << traj_point.v << ", t: " << traj_point.relative_time;
-
-  // LOG(INFO) << "Trajectory Generated";
-  return trajectory;
+  return spirals;
 }
 
-/*
-Using d = (v_f^2 - v_i^2) / (2 * a), compute the distance
-required for a given acceleration/deceleration.
-
-Inputs: v_i - the initial speed in m/s.
-        v_f - the final speed in m/s.
-        a - the acceleration in m/s^2.
-        */
-
-double VelocityProfileGenerator::calc_distance(const double& v_i,
-                                               const double& v_f,
-                                               const double& a) const {
-  double d{0.0};
-  if (std::abs(a) < DBL_EPSILON) {
-    d = std::numeric_limits<double>::infinity();
-  } else {
-    // TODO-calc distance: use one of the common rectilinear accelerated
-    // equations of motion to calculate the distance traveled while going from
-    // v_i (initial velocity) to v_f (final velocity) at a constant
-    // acceleration/deceleration "a". HINT look at the description of this
-    // function. Make sure you handle div by 0
-    d = 0;  // <- Update
-  }
-  return d;
+bool MotionPlanner::valid_spiral(const std::vector<PathPoint>& spiral,
+                                 const State& offset_goal) {
+  auto n = spiral.size();
+  auto delta_x = (offset_goal.location.x - spiral[n - 1].x);
+  auto delta_y = (offset_goal.location.y - spiral[n - 1].y);
+  auto dist = std::sqrt((delta_x * delta_x) + (delta_y * delta_y));
+  // auto dist = utils::magnitude(spiral[spiral.size() - 1].location -
+  //                              offset_goal.location);
+  // LOG(INFO) << "Distance from Spiral end to offset_goal: " << dist;
+  return (dist < 0.1);
 }
 
-/*
-Using v_f = sqrt(v_i ^ 2 + 2ad), compute the final speed for a given
-acceleration across a given distance, with initial speed v_i.
-Make sure to check the discriminant of the radical. If it is negative,
-return zero as the final speed.
-Inputs : v_i - the initial speed in m / s.
-v_f - the ginal speed in m / s.
-a - the acceleration in m / s ^ 2.
-*/
-double VelocityProfileGenerator::calc_final_speed(const double& v_i,
-                                                  const double& a,
-                                                  const double& d) const {
-  double v_f{0.0};
-  // TODO-calc final speed: Calculate the final distance. HINT: look at the
-  // description of this function. Make sure you handle negative discriminant
-  // and make v_f = 0 in that case. If the discriminant is inf or nan return
-  // infinity
+float MotionPlanner::calculate_cost(const std::vector<PathPoint>& spiral,
+                                    const std::vector<State>& obstacles,
+                                    const State& goal) {
+  // LOG(INFO) << "Starting spiral cost calc";
+  // Initialize cost to 0.0
+  float cost = 0.0;
+  cost += cf::collision_circles_cost_spiral(spiral, obstacles);
 
-  double disc = 0;  // <- Fix this
-  if (disc <= 0.0) {
-    v_f = 0.0;
-  } else if (disc == std::numeric_limits<double>::infinity() ||
-             std::isnan(disc)) {
-    v_f = std::numeric_limits<double>::infinity();
-  } else {
-    v_f = std::sqrt(disc);
-  }
-  //   std::cout << "v_i, a, d: " << v_i << ", " << a << ", " << d
-  //             << ",  v_f: " << v_f << std::endl;
-  return v_f;
+  cost += cf::close_to_main_goal_cost_spiral(spiral, goal);
+
+  // LOG(INFO) << "Path Cost: " << cost;
+  return cost;
 }
