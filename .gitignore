@@ -1,0 +1,6 @@
+*__pycache__
+*.ipynb_checkpoints/
+*.bak
+project/starter_files/libcarla-install/
+project/starter_files/rpclib/
+project/starter_files/eigen-3.3.7/
