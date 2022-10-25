@@ -391,7 +391,7 @@ double VelocityProfileGenerator::calc_final_speed(const double& v_i,
   // and make v_f = 0 in that case. If the discriminant is inf or nan return
   // infinity
 
-  double disc =pow(v_i, 2) + 2 * a * d;
+  double disc = pow(v_i, 2) + 2 * a * d;
   if (disc <= 0.0) {
     v_f = 0.0;
   } else if (disc == std::numeric_limits<double>::infinity() ||
